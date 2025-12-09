@@ -47,8 +47,12 @@ from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier, GradientBoostingClassifier
 from sklearn.linear_model import SGDClassifier
 from sklearn.preprocessing import StandardScaler
+from pathlib import Path
 
-LOCAL_CSV = "WA_Fn-UseC_-Telco-Customer-Churn.csv"
+PROJECT_DIR = Path(__file__).resolve().parents[1]
+DATA_DIR = PROJECT_DIR / "data"
+OUTPUTS_DIR = PROJECT_DIR / "outputs"
+LOCAL_CSV = DATA_DIR / "WA_Fn-UseC_-Telco-Customer-Churn.csv"
 
 # AWS Config (for Bonus)
 S3_BUCKET = os.environ.get("MODEL_BUCKET", "769341382710-model")
@@ -207,7 +211,30 @@ def build_keras_model(input_dim: int):
     Return:
       - a compiled Keras model ready for training.
     """
-    raise NotImplementedError("TODO: implement build_keras_model(input_dim).")
+    model = keras.Sequential([
+        layers.Input(shape=(input_dim,)),
+
+        layers.Dense(128, activation="relu", name='dense_1'),
+        layers.Dropout(0.3, name='dropout_1'),
+
+        layers.Dense(64, activation="relu", name='dense_2'),
+        layers.Dropout(0.3, name='dropout_2'),
+
+        layers.Dense(32, activation="relu", name='dense_3'),
+        layers.Dropout(0.2, name='dropout_3'),
+
+        layers.Dense(1, activation="sigmoid", name='output'),
+    ])
+
+    model.compile(
+        optimizer=keras.optimizers.Adam(learning_rate=1e-3),
+        loss="binary_crossentropy",
+        metrics=[
+            keras.metrics.AUC(), 
+            "accuracy"
+        ]
+    )
+    return model
 
 ############################
 # Scikit-Learn Models – TODO
@@ -247,8 +274,76 @@ def train_sklearn_models(preprocessor, X, y):
       - sgd_model: the chosen SGD-based pipeline for deployment
       - sgd_auc: AUC of that SGD model
     """
-    raise NotImplementedError("TODO: implement train_sklearn_models(preprocessor, X, y).")
+    X_train, X_val, y_train, y_val = train_test_split(
+        X, y, 
+        test_size=0.2, 
+        random_state=42, 
+        stratify=y
+    )
 
+    models_to_train = [
+        (
+            "Logistic Regression", 
+            LogisticRegression(
+                max_iter=500, 
+                random_state=42
+            )
+        ),
+        (
+            "Random Forest",
+            RandomForestClassifier(
+                n_estimators=100, 
+                max_depth=10,
+                random_state=42
+            )
+        ),
+        (
+            "Gradient Boosting",
+            GradientBoostingClassifier(
+                n_estimators=100,
+                learning_rate=0.1,
+                max_depth=5,
+                random_state=42
+            )
+        ),
+        (
+            "SGD Classifier", 
+            SGDClassifier(
+                loss="log_loss", 
+                max_iter=1000,
+                tol=1e-3,
+                random_state=42
+            )
+        )
+    ]
+
+    results = []
+    sgd_model = None
+    sgd_auc = 0.0
+
+    for model_name, classifier in models_to_train:
+        pipeline = Pipeline([
+            ("preprocessor", preprocessor),
+            ("clf", classifier)
+        ])
+
+        pipeline.fit(X_train, y_train)
+
+        y_val_proba = pipeline.predict_proba(X_val)[:, 1]
+        y_val_pred = pipeline.predict(X_val)
+
+        auc_score = roc_auc_score(y_val, y_val_proba)
+        acc_score = accuracy_score(y_val, y_val_pred)
+
+        results.append((model_name, pipeline, auc_score, acc_score))
+
+        if model_name == "SGD Classifier":
+            sgd_model = pipeline
+            sgd_auc = auc_score
+        
+
+    results.sort(key=lambda x: x[2], reverse=True)
+    return results, (X_train, X_val, y_train, y_val), sgd_model, sgd_auc
 
 ################################################
 # 4) Lightweight Artifact for AWS – TODO (Bonus)
@@ -345,7 +440,7 @@ def main():
     (X_train, X_val, y_train, y_val) = splits
 
     # sk_results should be sorted by AUC (descending)
-    best_sklearn_name, best_sklearn_model, best_sklearn_auc = sk_results[0]
+    best_sklearn_name, best_sklearn_model, best_sklearn_auc, best_sklearn_acc = sk_results[0]
 
     # Step 3: Keras model
     print("Preparing numpy for Keras...")
@@ -372,10 +467,13 @@ def main():
         verbose=1,
     )
 
+    # ensure outputs directory exists
+    OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+
     # Save gradient history locally for inspection
-    with open("keras_gradients.json", "w") as f:
+    with open(OUTPUTS_DIR / "keras_gradients.json", "w") as f:
         json.dump(grad_tracker.history, f, indent=2)
-    print("Saved gradient stats to keras_gradients.json")
+    print(f"Saved gradient stats to {OUTPUTS_DIR / 'keras_gradients.json'}")
 
     # Step 4: Evaluate Keras on validation set
     y_val_pred = keras_model.predict(X_val_np).ravel()
@@ -410,9 +508,8 @@ def main():
       final_auc        = ...
     """
 
-    # Example placeholder (replace with your own logic):
-    if keras_auc >= best_sklearn_auc:
-        final_model_name = "keras_model"
+    if keras_auc >= best_sklearn_auc - 0.1:
+        final_model_name = "keras_mlp"
         final_auc = keras_auc
     else:
         final_model_name = best_sklearn_name
@@ -422,12 +519,13 @@ def main():
 
     # Step 6: Build leaderboard (for analysis/report)
     model_leaderboard = []
-    for name, model_obj, auc_val in sk_results:
+    for name, model_obj, auc_val, acc_val in sk_results:
         model_leaderboard.append(
             {
                 "name": name,
                 "type": "sklearn",
                 "auc": float(auc_val),
+                "accuracy": float(acc_val),
             }
         )
 
@@ -447,9 +545,9 @@ def main():
     # At this point you can:
     #   - Save model_leaderboard to disk as JSON or CSV for inspection.
     #   - Create plots (e.g., bar charts of AUC/accuracy) in a separate script/notebook.
-    with open("model_leaderboard_telco.json", "w") as f:
+    with open(OUTPUTS_DIR / "model_leaderboard_telco.json", "w") as f:
         json.dump(model_leaderboard, f, indent=2)
-    print("Saved model_leaderboard_telco.json")
+    print(f"Saved model_leaderboard_telco.json to {OUTPUTS_DIR / 'model_leaderboard_telco.json'}")
 
     # Step 7 (Bonus): Build lightweight artifact for AWS Lambda
     if ENABLE_AWS_EXPORT:
